@@ -1,0 +1,241 @@
+#!/usr/bin/env python
+
+"""
+Monitor civstats and record statistics
+"""
+
+import argparse, sys, glob, os, doctest, re, subprocess, time
+
+_VERBOSE = False
+
+EVENTS = ["Logged in",
+          "Finished turn",
+          "Logged out",
+          "Score",
+          "A new turn",
+          "Eliminated"]
+
+LOGIN, FINISH, LOGOUT, SCORE, NEWTURN, ELIMINATION = range(6)
+
+###############################################################################
+def parse_command_line(args, description):
+###############################################################################
+    parser = argparse.ArgumentParser(
+        usage="""\n%s [--verbose]
+OR
+%s --help
+OR
+%s --test
+
+\033[1mEXAMPLES:\033[0m
+    \033[1;32m# Run \033[0m
+    > %s &
+""" % ((os.path.basename(args[0]), ) * 4),
+
+description=description,
+
+formatter_class=argparse.ArgumentDefaultsHelpFormatter
+)
+
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="Print extra information")
+
+    args = parser.parse_args(args[1:])
+
+    global _VERBOSE
+    _VERBOSE = args.verbose
+
+    return None
+
+###############################################################################
+def expect(condition, error_msg):
+###############################################################################
+    """
+    Similar to assert except doesn't generate an ugly stacktrace. Useful for
+    checking user error, not programming error.
+
+    >>> expect(True, "error1")
+    >>> expect(False, "error2")
+    Traceback (most recent call last):
+        ...
+    SystemExit: FAIL: error2
+    """
+    if (not condition):
+        raise SystemExit("FAIL: %s" % error_msg)
+
+###############################################################################
+def verbose_print(msg, override=None):
+###############################################################################
+    if ( (_VERBOSE and not override is False) or override):
+        print msg
+
+###############################################################################
+def run_cmd(cmd, ok_to_fail=False, input_str=None, from_dir=None, verbose=None,
+            arg_stdout=subprocess.PIPE, arg_stderr=subprocess.PIPE):
+###############################################################################
+    """
+    Wrapper around subprocess to make it much more convenient to run shell commands
+    """
+    verbose_print("RUN: %s" % cmd, verbose)
+
+    if (input_str is not None):
+        stdin = subprocess.PIPE
+    else:
+        stdin = None
+
+    proc = subprocess.Popen(cmd,
+                            shell=True,
+                            stdout=arg_stdout,
+                            stderr=arg_stderr,
+                            stdin=stdin,
+                            cwd=from_dir)
+    output, errput = proc.communicate(input_str)
+    output = output.strip() if output is not None else output
+    errput = errput.strip() if errput is not None else errput
+    stat = proc.wait()
+
+    verbose_print("  stat: %d\n" % stat, verbose)
+    verbose_print("  output: %s\n" % output, verbose)
+    verbose_print("  errput: %s\n" % errput, verbose)
+
+    if (ok_to_fail):
+        return stat, output, errput
+    else:
+        if (arg_stderr is not None):
+            errput = errput if errput is not None else open(arg_stderr.name, "r").read()
+            expect(stat == 0, "Command: '%s' failed with error '%s'" % (cmd, errput))
+        else:
+            expect(stat == 0, "Command: '%s' failed. See terminal output" % cmd)
+        return output
+
+###############################################################################
+def get_state_from_webdata(webdata):
+###############################################################################
+    """
+    >>> test_str = r'''
+    ... <tr>
+    ...   <td align="center" class="smheading">Time</td>
+    ...   <td align="center" class="smheading">Player</td>
+    ... <td align="center" class="smheading">Event</td>
+    ... </tr>
+    ... <tr id="event5-8120564-5">
+    ...   <td align="center" class="dark">12/15/15 2:17 am</td>
+    ...   <td align="center" class="dark">blueraja</td>
+    ...   <td align="center" class="event5">Logged out</td>
+    ... </tr>
+    ... <tr id="event8-8120563-5">
+    ...   <td align="center" class="dark">12/15/15 2:15 am</td>
+    ...   <td align="center" class="dark">blueraja</td>
+    ...   <td align="center" class="event8">Finished turn</td>
+    ... </tr>
+    ... <tr id="event4-8120562-5">
+    ...   <td align="center" class="dark">12/15/15 2:14 am</td>
+    ...   <td align="center" class="dark">blueraja</td>
+    ...   <td align="center" class="event4">Logged in</td>
+    ... </tr>
+    ... <tr id="event5-8120466-3">
+    ...   <td align="center" class="dark">12/14/15 9:04 pm</td>
+    ...   <td align="center" class="dark">beefybro</td>
+    ...   <td align="center" class="event5">Logged out</td>
+    ... </tr>
+    ... <tr id="event2-8120465-3">
+    ...   <td align="center" class="dark">12/14/15 9:03 pm</td>
+    ...   <td align="center" class="dark">beefybro</td>
+    ...   <td align="center" class="event2">Score decreased to 155</td>
+    ... </tr>
+    ... <tr id="event8-8120464-3">
+    ...   <td align="center" class="dark">12/14/15 9:02 pm</td>
+    ...   <td align="center" class="dark">beefybro</td>
+    ...   <td align="center" class="event8">Finished turn</td>
+    ... </tr>
+    ... <tr id="event4-8120463-3">
+    ...   <td align="center" class="dark">12/14/15 9:02 pm</td>
+    ...   <td align="center" class="dark">beefybro</td>
+    ...   <td align="center" class="event4">Logged in</td>
+    ... </tr>
+    ... '''
+    >>> get_state_from_webdata(test_str)
+    [('beefybro', 0, 1450152120), ('beefybro', 1, 1450152120), ('beefybro', 3, 1450152180), ('beefybro', 2, 1450152240), ('blueraja', 0, 1450170840), ('blueraja', 1, 1450170900), ('blueraja', 2, 1450171020)]
+    """
+    begin_block_str = '<tr id="event'
+    date_regex = re.compile(r".*>\s*(\d\d?)/(\d\d?)/(\d\d?)\s+(\d\d?):(\d\d?)\s+(am|pm)\s*<")
+    player_regex = re.compile(r".*>\s*(.*)\s*<")
+    event_regex = re.compile(r".*>\s*(.+)\s*<")
+    end_block_str = "</tr>"
+
+    rv = [] # (player, event, date)
+
+    curr_date = None
+    curr_player = None
+    curr_event = None
+    inside_block = False
+
+    for idx, line in enumerate(webdata.splitlines()):
+        if (begin_block_str in line):
+            expect(not inside_block, "Error at line %d: Already in block!" % idx)
+            inside_block = True
+        elif (inside_block):
+            if (curr_date is None):
+                date_match = date_regex.match(line)
+                expect(date_match is not None, "Error at line %d: Expected date match" % idx)
+
+                month, day, year, hour, minute, ampm = date_match.groups()
+                year, month, day, hour, minute = int(year), int(month), int(day), int(hour), int(minute)
+                hour = hour + 12 if ampm == "pm" else hour
+                time_tuple = (year, month, day, hour, minute, 0, 0, 0, 0)
+                curr_date = int(time.mktime(time_tuple))
+
+            elif (curr_player is None):
+                player_match = player_regex.match(line)
+                expect(player_match is not None, "Error at line %d: Expected player match" % idx)
+                curr_player = player_match.groups()[0]
+
+            elif (curr_event is None):
+                event_match = event_regex.match(line)
+                expect(event_match is not None, "Error at line %d: Expected event match" % idx)
+
+                event_str = event_match.groups()[0]
+                for event_id, event_prefix in enumerate(EVENTS):
+                    if (event_str.startswith(event_prefix)):
+                        curr_event = event_id
+
+                expect(curr_event is not None, "Couldn't id event str '%s'" % event_str)
+
+            else:
+                expect(end_block_str in line, "Error at line %d: Expected end of block" % idx)
+                rv.insert( 0, (curr_player, curr_event, curr_date) )
+                curr_date, curr_player, curr_event = None, None, None
+                inside_block = False
+
+    expect(not inside_block, "File terminated without completing block")
+
+    return rv
+
+###############################################################################
+def bagger_board():
+###############################################################################
+    # Get data
+    webdata = run_cmd("curl http://www.civstats.com/viewgame.php?gameid=2890")
+
+    # Convert webdata to state
+    events = get_state_from_webdata(webdata)
+
+    # Compare against most recent state
+
+    # If new, update file
+
+###############################################################################
+def _main_func(description):
+###############################################################################
+    if ("--test" in sys.argv):
+        test_results = doctest.testmod(verbose=True)
+        sys.exit(1 if test_results.failed > 0 else 0)
+
+    parse_command_line(sys.argv, description)
+
+    bagger_board()
+
+###############################################################################
+
+if (__name__ == "__main__"):
+    _main_func(__doc__)
