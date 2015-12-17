@@ -4,18 +4,9 @@
 Monitor civstats and record statistics
 """
 
-import argparse, sys, glob, os, doctest, re, subprocess, time
+import argparse, sys, os, doctest, re, time
 
-_VERBOSE = False
-
-EVENTS = ["Logged in",
-          "Finished turn",
-          "Logged out",
-          "Score",
-          "A new turn",
-          "Eliminated"]
-
-LOGIN, FINISH, LOGOUT, SCORE, NEWTURN, ELIMINATION = range(6)
+from bagger_common import expect, run_cmd, update_db_file, set_verbosity
 
 ###############################################################################
 def parse_command_line(args, description):
@@ -29,7 +20,7 @@ OR
 
 \033[1mEXAMPLES:\033[0m
     \033[1;32m# Run \033[0m
-    > %s &
+    > %s http://www.civstats.com/viewgame.php?gameid=2890 ndsgame8.bag &
 """ % ((os.path.basename(args[0]), ) * 4),
 
 description=description,
@@ -38,78 +29,25 @@ formatter_class=argparse.ArgumentDefaultsHelpFormatter
 )
 
     parser.add_argument("-v", "--verbose", action="store_true",
-                        help="Print extra information")
+                        help="Print extra information.")
+
+    parser.add_argument("-i", "--interval", type=int, default=3600,
+                        help="Time, in seconds, to wait between scrapes.")
+
+    parser.add_argument("website",
+                        help="URL of civstats webpage to scrape.")
+
+    parser.add_argument("dbfile",
+                        help="File to load/store results.")
 
     args = parser.parse_args(args[1:])
 
-    global _VERBOSE
-    _VERBOSE = args.verbose
+    set_verbosity(args.verbose)
 
-    return None
-
-###############################################################################
-def expect(condition, error_msg):
-###############################################################################
-    """
-    Similar to assert except doesn't generate an ugly stacktrace. Useful for
-    checking user error, not programming error.
-
-    >>> expect(True, "error1")
-    >>> expect(False, "error2")
-    Traceback (most recent call last):
-        ...
-    SystemExit: FAIL: error2
-    """
-    if (not condition):
-        raise SystemExit("FAIL: %s" % error_msg)
+    return args.website, args.dbfile, args.interval
 
 ###############################################################################
-def verbose_print(msg, override=None):
-###############################################################################
-    if ( (_VERBOSE and not override is False) or override):
-        print msg
-
-###############################################################################
-def run_cmd(cmd, ok_to_fail=False, input_str=None, from_dir=None, verbose=None,
-            arg_stdout=subprocess.PIPE, arg_stderr=subprocess.PIPE):
-###############################################################################
-    """
-    Wrapper around subprocess to make it much more convenient to run shell commands
-    """
-    verbose_print("RUN: %s" % cmd, verbose)
-
-    if (input_str is not None):
-        stdin = subprocess.PIPE
-    else:
-        stdin = None
-
-    proc = subprocess.Popen(cmd,
-                            shell=True,
-                            stdout=arg_stdout,
-                            stderr=arg_stderr,
-                            stdin=stdin,
-                            cwd=from_dir)
-    output, errput = proc.communicate(input_str)
-    output = output.strip() if output is not None else output
-    errput = errput.strip() if errput is not None else errput
-    stat = proc.wait()
-
-    verbose_print("  stat: %d\n" % stat, verbose)
-    verbose_print("  output: %s\n" % output, verbose)
-    verbose_print("  errput: %s\n" % errput, verbose)
-
-    if (ok_to_fail):
-        return stat, output, errput
-    else:
-        if (arg_stderr is not None):
-            errput = errput if errput is not None else open(arg_stderr.name, "r").read()
-            expect(stat == 0, "Command: '%s' failed with error '%s'" % (cmd, errput))
-        else:
-            expect(stat == 0, "Command: '%s' failed. See terminal output" % cmd)
-        return output
-
-###############################################################################
-def get_state_from_webdata(webdata):
+def get_events_from_webdata(webdata):
 ###############################################################################
     """
     >>> test_str = r'''
@@ -154,7 +92,7 @@ def get_state_from_webdata(webdata):
     ...   <td align="center" class="event4">Logged in</td>
     ... </tr>
     ... '''
-    >>> get_state_from_webdata(test_str)
+    >>> get_events_from_webdata(test_str)
     [('beefybro', 0, 1450152120), ('beefybro', 1, 1450152120), ('beefybro', 3, 1450152180), ('beefybro', 2, 1450152240), ('blueraja', 0, 1450170840), ('blueraja', 1, 1450170900), ('blueraja', 2, 1450171020)]
     """
     begin_block_str = '<tr id="event'
@@ -172,12 +110,12 @@ def get_state_from_webdata(webdata):
 
     for idx, line in enumerate(webdata.splitlines()):
         if (begin_block_str in line):
-            expect(not inside_block, "Error at line %d: Already in block!" % idx)
+            expect(not inside_block, "Error at line %d: Already in block!\n\nWebdata:\n%s" % (idx, webdata))
             inside_block = True
         elif (inside_block):
             if (curr_date is None):
                 date_match = date_regex.match(line)
-                expect(date_match is not None, "Error at line %d: Expected date match" % idx)
+                expect(date_match is not None, "Error at line %d: Expected date match\n\nWebdata:\n%s" % (idx, webdata))
 
                 month, day, year, hour, minute, ampm = date_match.groups()
                 year, month, day, hour, minute = int(year), int(month), int(day), int(hour), int(minute)
@@ -187,42 +125,41 @@ def get_state_from_webdata(webdata):
 
             elif (curr_player is None):
                 player_match = player_regex.match(line)
-                expect(player_match is not None, "Error at line %d: Expected player match" % idx)
+                expect(player_match is not None, "Error at line %d: Expected player match\n\nWebdata:\n%s" % (idx, webdata))
                 curr_player = player_match.groups()[0]
 
             elif (curr_event is None):
                 event_match = event_regex.match(line)
-                expect(event_match is not None, "Error at line %d: Expected event match" % idx)
-
-                event_str = event_match.groups()[0]
-                for event_id, event_prefix in enumerate(EVENTS):
-                    if (event_str.startswith(event_prefix)):
-                        curr_event = event_id
-
-                expect(curr_event is not None, "Couldn't id event str '%s'" % event_str)
+                expect(event_match is not None, "Error at line %d: Expected event match\n\nWebdata:\n%s" % (idx, webdata))
+                curr_event = event_match.groups()[0]
 
             else:
-                expect(end_block_str in line, "Error at line %d: Expected end of block" % idx)
+                expect(end_block_str in line, "Error at line %d: Expected end of block\n\nWebdata:\n%s" % (idx, webdata))
                 rv.insert( 0, (curr_player, curr_event, curr_date) )
                 curr_date, curr_player, curr_event = None, None, None
                 inside_block = False
 
-    expect(not inside_block, "File terminated without completing block")
+    expect(not inside_block, "File terminated without completing block\n\nWebdata:\n%s" % webdata)
 
     return rv
 
 ###############################################################################
-def bagger_board():
+def bagger_board(website, dbfile, interval):
 ###############################################################################
-    # Get data
-    webdata = run_cmd("curl http://www.civstats.com/viewgame.php?gameid=2890")
+    while (True):
+        # Get data
+        webdata = run_cmd("curl %s" % website)
 
-    # Convert webdata to state
-    events = get_state_from_webdata(webdata)
+        # Convert webdata to state
+        events = get_events_from_webdata(webdata)
 
-    # Compare against most recent state
+        # update db file
+        update_db_file(dbfile, events)
 
-    # If new, update file
+        time.sleep(interval)
+
+        sys.stdout.write(".")
+        sys.stdout.flush()
 
 ###############################################################################
 def _main_func(description):
@@ -231,9 +168,9 @@ def _main_func(description):
         test_results = doctest.testmod(verbose=True)
         sys.exit(1 if test_results.failed > 0 else 0)
 
-    parse_command_line(sys.argv, description)
+    website, dbfile, interval = parse_command_line(sys.argv, description)
 
-    bagger_board()
+    bagger_board(website, dbfile, interval)
 
 ###############################################################################
 
